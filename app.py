@@ -5,6 +5,7 @@ from nlp_engine import (
     discover_topics, extract_entities, extract_pdf, keyword_scores, most_common_terms,
     retrieve, sentences, textrank_summary, tokenize, stem_tokens, pos_tag_text,
     classify_papers, compare_papers, detect_research_gaps, extract_research_signals,
+    research_analysis,
 )
 
 st.set_page_config(
@@ -286,24 +287,193 @@ st.success(f"Analysis complete: {len(uploads)} paper(s) and {len(chunks)} pages 
 # Persistent workspace navigation.
 # st.tabs() resets to the first tab after every widget interaction. A horizontal
 # radio navigation keeps the selected workspace active across Streamlit reruns.
-sections = [
-    "Preprocessing", "POS & Linguistic Analysis", "Keywords", "Entities",
-    "Classification", "Topics", "Summary", "Compare Papers",
-    "Research Gaps", "Ask the Papers", "NLP Pipeline"
-]
-if "active_section" not in st.session_state:
-    st.session_state.active_section = "Preprocessing"
-
-st.markdown("<div class='rm-section-label' style='margin-top:1.6rem'>Analysis workspace</div>", unsafe_allow_html=True)
-active_section = st.radio(
-    "Analysis workspace",
-    sections,
-    key="active_section",
+# Two-level workspace: start with a researcher-friendly overview, then open the technical NLP tools.
+workspace_mode = st.radio(
+    "Research workspace",
+    ["🔎 Research Assistant", "🧠 NLP Analysis"],
+    key="workspace_mode",
     horizontal=True,
     label_visibility="collapsed",
 )
 
-if active_section == "Preprocessing":
+if "active_section" not in st.session_state:
+    st.session_state.active_section = "Preprocessing"
+
+if workspace_mode == "🔎 Research Assistant":
+    # Clean researcher-facing reading experience. Technical retrieval details stay in NLP Analysis.
+    st.markdown("""
+    <div class="rm-dashboard-hero">
+      <div class="rm-dashboard-kicker">RESEARCH ASSISTANT</div>
+      <h2>Understand your paper in minutes.</h2>
+      <p>ResearchMate first gives you a clear reading brief: what the paper studies, how the research was done, what was found, and what the authors say should happen next.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    paper_names = list(dict.fromkeys(c.paper for c in chunks))
+    selected_paper = st.selectbox(
+        "Choose a paper to understand",
+        paper_names,
+        key="assistant_paper",
+        label_visibility="visible",
+    )
+    paper_chunks = [c for c in chunks if c.paper == selected_paper]
+    paper_text = " ".join(c.text for c in paper_chunks)
+    paper_words = len(tokenize(paper_text))
+    paper_entities = extract_entities(paper_chunks)
+    paper_keywords = keyword_scores(paper_chunks, limit=8)
+    paper_summary = textrank_summary(paper_chunks, sentence_limit=5)
+    paper_classification, _ = classify_papers(paper_chunks)
+    domain = paper_classification[0]["Predicted domain"] if paper_classification else "Not detected"
+
+    # Step 1: quick orientation
+    st.markdown("### 1 · Paper at a glance")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Pages", len(paper_chunks))
+    k2.metric("Words", f"{paper_words:,}")
+    k3.metric("Domain", domain)
+    k4.metric("Entities", sum(len(v) for v in paper_entities.values()))
+
+    top_terms = ", ".join(k for k,_ in paper_keywords[:6]) or "Not detected"
+    datasets = ", ".join(paper_entities.get("Datasets", [])[:5]) or "Not detected"
+    models = ", ".join(paper_entities.get("Models / methods", [])[:5]) or "Not detected"
+    metrics = ", ".join(paper_entities.get("Metrics", [])[:5]) or "Not detected"
+    glance = st.columns(2)
+    with glance[0]:
+        st.markdown(f"<div class='rm-panel'><div class='rm-panel-title'>Main research terms</div><div class='rm-panel-sub'>{top_terms}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='rm-panel'><div class='rm-panel-title'>Datasets</div><div class='rm-panel-sub'>{datasets}</div></div>", unsafe_allow_html=True)
+    with glance[1]:
+        st.markdown(f"<div class='rm-panel'><div class='rm-panel-title'>Methods / models</div><div class='rm-panel-sub'>{models}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='rm-panel'><div class='rm-panel-title'>Evaluation metrics</div><div class='rm-panel-sub'>{metrics}</div></div>", unsafe_allow_html=True)
+
+    # Step 2: readable summary first
+    st.markdown("### 2 · What is this paper about?")
+    st.caption("ResearchMate selects important original sentences from the paper. Page numbers let you verify the summary in the source.")
+    if paper_summary:
+        summary_text = " ".join(sentence for sentence,_,_ in paper_summary)
+        st.markdown(f"<div class='rm-summary-card'><div class='rm-summary-text'>{summary_text}</div></div>", unsafe_allow_html=True)
+        with st.expander("Show the original summary sentences and page references"):
+            for i, (sentence, _, page) in enumerate(paper_summary, 1):
+                st.markdown(f"**{i}.** {sentence}")
+                st.caption(f"Source: Page {page}")
+    else:
+        st.info("A summary could not be extracted from this paper.")
+
+    # Step 3: actual research analysis — compact interpretations, not just copied paragraphs
+    st.markdown("### 3 · ResearchMate analysis")
+    analysis = research_analysis(paper_chunks)
+
+    st.markdown("#### 🧠 Executive insight")
+    st.markdown(f"<div class='rm-summary-card'><div class='rm-summary-text'>{analysis['executive_insight']}</div></div>", unsafe_allow_html=True)
+
+    a1, a2 = st.columns(2)
+    with a1:
+        st.markdown("#### ⚙️ Methodology analysis")
+        if analysis["method_roles"]:
+            for item in analysis["method_roles"]:
+                st.markdown(f"**{item['role']}**  \\n{item['evidence']}")
+        else:
+            st.info("No clear methodology roles were detected from the available text.")
+    with a2:
+        st.markdown("#### 🧪 Experiment analysis")
+        if analysis["experiment"]:
+            st.dataframe(pd.DataFrame(analysis["experiment"]), hide_index=True, use_container_width=True)
+        else:
+            st.info("No explicit train/validation/test quantities were detected.")
+
+    st.markdown("#### 📊 Result analysis")
+    if analysis["comparison"]:
+        result_df = pd.DataFrame([{
+            "Model": r["Model"],
+            "Primary reported score": r["Primary score"],
+        } for r in analysis["comparison"]])
+        st.dataframe(result_df, hide_index=True, use_container_width=True)
+        q = analysis["quantitative_insight"]
+        if q:
+            st.success(
+                f"ResearchMate comparison: {q['best_model']} reports the highest detected primary score "
+                f"({q['best_score']:.2f}), {q['difference']:.2f} points above {q['baseline_model']} ({q['baseline_score']:.2f})."
+            )
+        with st.expander("View the original result evidence"):
+            for r in analysis["comparison"]:
+                st.markdown(f"**{r['Model']}** — {r['Evidence']}")
+    else:
+        st.info("A comparable numeric result was not detected. ResearchMate will not invent a performance comparison.")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        st.markdown("#### 💡 Key research insights")
+        insights = []
+        if analysis["method_roles"]:
+            insights.append("The paper combines multiple processing/model stages rather than relying on a single NLP operation.")
+        if analysis["quantitative_insight"]:
+            q = analysis["quantitative_insight"]
+            insights.append(f"The detected comparison shows {q['best_model']} with the highest reported primary score.")
+            insights.append(f"The highest-to-lowest detected score difference is {q['difference']:.2f} points in this paper's reported experiment.")
+        if datasets:
+            insights.append(f"The reported evaluation uses: {datasets}.")
+        for item in insights[:4]:
+            st.markdown(f"• {item}")
+        if not insights:
+            st.info("Not enough structured evidence was detected for additional insights.")
+    with b2:
+        st.markdown("#### ⚠️ Critical analysis")
+        if analysis["limitations"]:
+            for row in analysis["limitations"][:4]:
+                st.markdown(f"• **Page {row['Page']}:** {row['Evidence']}")
+        else:
+            st.info("No explicit limitation signal was detected. This does not mean the paper has no limitations.")
+
+    st.markdown("#### 🚀 Future research analysis")
+    if analysis["future"]:
+        for row in analysis["future"][:4]:
+            st.markdown(f"• **Page {row['Page']}:** {row['Evidence']}")
+    else:
+        st.info("No explicit future-work signal was detected.")
+
+    with st.expander("📚 View source evidence used for the analysis"):
+        assistant_sections = [
+            ("Research problem & objective", "What problem does this paper address and what is its main objective?"),
+            ("Methodology", "What method, model, framework or approach does the paper propose or use?"),
+            ("Dataset & experimental setup", "What datasets, experimental setup or evaluation procedure are described?"),
+            ("Key findings & results", "What are the main findings, results or conclusions reported by the authors?"),
+            ("Limitations", "What limitations, challenges, drawbacks or constraints are explicitly reported?"),
+            ("Future work", "What future research directions or next steps are explicitly mentioned?"),
+        ]
+        for title, query in assistant_sections:
+            st.markdown(f"**{title}**")
+            results = retrieve(query, paper_chunks, limit=2)
+            if results:
+                for c, _, _ in results:
+                    st.markdown(f"- **Page {c.page}:** {c.text}")
+            else:
+                st.caption("No supporting passage found.")
+
+    # Step 4: questions
+    st.markdown("### 4 · Ask about the paper")
+    st.markdown("<div class='rm-panel'><div class='rm-panel-title'>Need a specific answer?</div><div class='rm-panel-sub'>Ask ResearchMate about the methods, datasets, results, limitations or any other information contained in the uploaded papers. Answers stay linked to the original page evidence.</div></div>", unsafe_allow_html=True)
+    if st.button("💬 Open Ask ResearchMate", type="primary", use_container_width=True):
+        st.session_state.workspace_mode = "🧠 NLP Analysis"
+        st.session_state.active_section = "Ask the Papers"
+        st.rerun()
+
+    st.caption("Tip: Start here for understanding. Use NLP Analysis when you want to inspect how ResearchMate processes the paper.")
+
+else:
+    st.markdown("<div class='rm-section-label' style='margin-top:1.6rem'>NLP analysis workspace</div>", unsafe_allow_html=True)
+    nlp_sections = [
+        "Preprocessing", "POS & Linguistic Analysis", "Keywords", "Entities",
+        "Classification", "Topics", "Summary", "Compare Papers",
+        "Research Gaps", "Ask the Papers", "NLP Pipeline"
+    ]
+    active_section = st.radio(
+        "NLP analysis workspace",
+        nlp_sections,
+        key="active_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+if workspace_mode == "🧠 NLP Analysis" and active_section == "Preprocessing":
     st.subheader("Live NLP preprocessing")
     sentence_count = sum(len(sentences(c.text)) for c in chunks)
     token_count = sum(len(tokenize(c.text)) for c in chunks)
@@ -335,7 +505,7 @@ if active_section == "Preprocessing":
     st.markdown("**Most frequent normalized terms**")
     st.write(" · ".join(f"{t} ({n})" for t,n in most_common_terms(chunks)))
 
-elif active_section == "POS & Linguistic Analysis":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "POS & Linguistic Analysis":
     st.subheader("POS tagging and linguistic analysis")
     st.caption("POS tags identify grammatical roles such as nouns, verbs, adjectives and adverbs.")
     options = [f"{c.paper} - page {c.page}" for c in chunks]
@@ -348,7 +518,7 @@ elif active_section == "POS & Linguistic Analysis":
         st.markdown("**POS distribution**")
         st.dataframe(counts, use_container_width=True, hide_index=True)
 
-elif active_section == "Keywords":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Keywords":
     keyword_rows = keyword_scores(chunks)
     st.markdown("""
     <div class="rm-keyword-hero">
@@ -393,7 +563,7 @@ elif active_section == "Keywords":
         rows = [{"Rank": i, "Keyphrase": p, "TF-IDF score": round(s, 4)} for i, (p, s) in enumerate(keyword_rows, 1)]
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
-elif active_section == "Entities":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Entities":
     st.markdown("""
     <div class="rm-dashboard-hero">
       <div class="rm-dashboard-kicker">Research entity intelligence</div>
@@ -412,7 +582,7 @@ elif active_section == "Entities":
             chips = ''.join(f"<span class='rm-chip'>{v}</span>" for v in values[:30]) if values else '<span style="color:#8293a3;font-size:.76rem">No matching entities found.</span>'
             st.markdown(f"<div class='rm-entity-card'><div class='rm-dashboard-kicker' style='color:#7890a5'>{label}</div><div class='rm-entity-count'>{len(values)}</div><div style='margin-top:.35rem'>{chips}</div></div>", unsafe_allow_html=True)
 
-elif active_section == "Classification":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Classification":
     st.subheader("Research-paper text classification")
     st.caption("A transparent TF-IDF keyword baseline estimates a broad research domain. "
                "The result is intended as a lightweight, interpretable classification aid.")
@@ -422,7 +592,7 @@ elif active_section == "Classification":
         st.markdown("**Classifier evaluation**")
         st.json(evaluation)
 
-elif active_section == "Topics":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Topics":
     st.markdown("""
     <div class="rm-dashboard-hero">
       <div class="rm-dashboard-kicker">NMF topic discovery</div>
@@ -443,7 +613,7 @@ elif active_section == "Topics":
     else:
         st.info("Upload at least two pages of text to discover topics.")
 
-elif active_section == "Summary":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Summary":
     st.markdown("""
     <div class="rm-dashboard-hero">
       <div class="rm-dashboard-kicker">TextRank extractive summary</div>
@@ -460,7 +630,7 @@ elif active_section == "Summary":
     else:
         st.info("No summary sentences could be ranked from the uploaded text.")
 
-elif active_section == "Compare Papers":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Compare Papers":
     st.markdown("""
     <div class="rm-dashboard-hero">
       <div class="rm-dashboard-kicker">Multi-paper literature view</div>
@@ -480,7 +650,7 @@ elif active_section == "Compare Papers":
         signals = extract_research_signals(chunks)
         st.dataframe(signals, use_container_width=True, hide_index=True)
 
-elif active_section == "Research Gaps":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Research Gaps":
     st.markdown("""
     <div class="rm-dashboard-hero">
       <div class="rm-dashboard-kicker">Research signal exploration</div>
@@ -500,7 +670,7 @@ elif active_section == "Research Gaps":
         else:
             st.info("No strong recurring gap signal was detected from the available limitations/future-work evidence.")
 
-elif active_section == "Ask the Papers":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "Ask the Papers":
     st.markdown("""
     <div class="rm-ask-hero">
       <div class="rm-ask-kicker">Evidence-first research assistant</div>
@@ -599,7 +769,7 @@ elif active_section == "Ask the Papers":
     elif ask and not st.session_state.rm_error:
         st.info("No relevant evidence was found. Try a more specific question using terms from the papers.")
 
-elif active_section == "NLP Pipeline":
+elif workspace_mode == "🧠 NLP Analysis" and active_section == "NLP Pipeline":
     st.subheader("End-to-end NLP pipeline")
     pipeline = [
         ("1. Document", "Research-paper PDF"),

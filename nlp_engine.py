@@ -344,3 +344,123 @@ def _classify_training_demo():
     """Small public API placeholder kept separate so a real labeled corpus can
     be plugged in later without changing the Streamlit interface."""
     return None
+
+
+def research_analysis(chunks: list[Chunk]) -> dict:
+    """Evidence-first research analysis for the Research Assistant.
+
+    This layer does not invent facts. It derives compact interpretations from
+    detected methods, datasets, metrics and numeric result statements/tables.
+    """
+    text = " ".join(c.text for c in chunks)
+    low = text.lower()
+    entities = extract_entities(chunks)
+
+    # Method roles are inferred from the paper's own vocabulary.
+    method_roles = []
+    role_rules = [
+        ("Preprocessing", ["tokenization", "tokenisation", "stopword", "lemmatization", "stemming", "sentence segmentation"]),
+        ("Feature / representation", ["tf-idf", "tfidf", "embedding", "sentence representation", "bert", "transformer"]),
+        ("Model / classifier", ["logistic regression", "svm", "support vector", "lstm", "bilstm", "transformer", "classifier"]),
+        ("Similarity / retrieval", ["cosine similarity", "semantic search", "retrieval", "similarity search"]),
+        ("Summarization / topic analysis", ["textrank", "text rank", "nmf", "topic modeling", "topic modelling"]),
+        ("Evaluation", ["accuracy", "precision", "recall", "f1", "f1-score", "auc", "rmse", "mae"]),
+    ]
+    for role, terms in role_rules:
+        found = [t for t in terms if t in low]
+        if found:
+            method_roles.append({"role": role, "evidence": ", ".join(found[:4])})
+
+    # Dataset size / split signals.
+    experiment = []
+    for pat, label in [
+        (r"(\d[\d,]*)\s*(?:training|train)\b", "Training samples"),
+        (r"(\d[\d,]*)\s*(?:validation|valid)\b", "Validation samples"),
+        (r"(\d[\d,]*)\s*(?:test|testing)\b", "Test samples"),
+        (r"(\d{1,3})\s*%\s*(?:training|train)\b", "Training split"),
+        (r"(\d{1,3})\s*%\s*(?:validation|valid)\b", "Validation split"),
+        (r"(\d{1,3})\s*%\s*(?:test|testing)\b", "Test split"),
+    ]:
+        m = re.search(pat, low)
+        if m:
+            experiment.append({"item": label, "value": m.group(1) + ("%" if "split" in label else "")})
+
+    # Detect common model/result rows from prose and simple PDF-extracted tables.
+    model_names = list(dict.fromkeys(entities.get("Models / methods", [])))
+    metric_names = [m.lower() for m in entities.get("Metrics", [])]
+    results = []
+    for sentence in sentences(text):
+        if not re.search(r"\b(?:accuracy|precision|recall|f1|f1-score|score|auc|rmse|mae)\b", sentence, re.I):
+            continue
+        nums = re.findall(r"(?<!\w)(?:100(?:\.0+)?|\d{1,2}(?:\.\d+)?)\s*%|(?<!\w)0?\.\d+(?!\w)", sentence)
+        if not nums:
+            continue
+        vals = []
+        for n in nums[:6]:
+            try:
+                v = float(n.replace("%", ""))
+                vals.append(v if "%" not in n else v)
+            except ValueError:
+                pass
+        mentioned = [m for m in model_names if m.lower() in sentence.lower()]
+        if mentioned:
+            results.append({"Model": mentioned[0], "Values": vals, "Evidence": sentence})
+
+    # Deduplicate result rows while preserving evidence.
+    unique = []
+    seen = set()
+    for r in results:
+        key = (r["Model"].lower(), tuple(round(x, 4) for x in r["Values"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+    results = unique[:12]
+
+    # Quantitative comparison: use the first percentage/score as the primary value.
+    comparison = []
+    for r in results:
+        if r["Values"]:
+            comparison.append({"Model": r["Model"], "Primary score": r["Values"][0], "Evidence": r["Evidence"]})
+    comparison.sort(key=lambda x: x["Primary score"], reverse=True)
+    quantitative_insight = None
+    if len(comparison) >= 2:
+        best, baseline = comparison[0], comparison[-1]
+        diff = best["Primary score"] - baseline["Primary score"]
+        quantitative_insight = {
+            "best_model": best["Model"],
+            "best_score": best["Primary score"],
+            "baseline_model": baseline["Model"],
+            "baseline_score": baseline["Primary score"],
+            "difference": round(diff, 2),
+        }
+
+    # Evidence-based limitation/future signals.
+    signals = extract_research_signals(chunks)
+    limitations = [r for r in signals if r["Type"] == "Limitation"][:5]
+    future = [r for r in signals if r["Type"] == "Future work"][:5]
+
+    # Executive insight is intentionally cautious and tied to detected evidence.
+    insight_parts = []
+    if entities.get("Models / methods"):
+        insight_parts.append("The paper evaluates or applies " + ", ".join(entities["Models / methods"][:3]) + ".")
+    if quantitative_insight:
+        q = quantitative_insight
+        insight_parts.append(
+            f"Among the detected reported scores, {q['best_model']} has the highest primary score "
+            f"({q['best_score']:.2f}), which is {q['difference']:.2f} points above {q['baseline_model']} ({q['baseline_score']:.2f})."
+        )
+    if entities.get("Datasets"):
+        insight_parts.append("The evaluation references " + ", ".join(entities["Datasets"][:3]) + ".")
+    if limitations:
+        insight_parts.append("The paper also reports limitations or challenges that should be considered when interpreting the results.")
+
+    return {
+        "method_roles": method_roles,
+        "experiment": experiment,
+        "results": results,
+        "comparison": comparison,
+        "quantitative_insight": quantitative_insight,
+        "limitations": limitations,
+        "future": future,
+        "executive_insight": " ".join(insight_parts) if insight_parts else "The available evidence was not sufficient to form a stronger automated interpretation.",
+    }
